@@ -3,11 +3,12 @@ import ijson
 from collections import defaultdict
 from datetime import datetime
 import sys
+from urllib.parse import urlparse
 
 sys.stdout.reconfigure(encoding='utf-8')
 
 if len(sys.argv) < 2:
-    print("Usage: python test.py <path_to_trace_file>")
+    print("Usage: python detect_duplicates.py <path_to_trace_file>")
     sys.exit(1)
 
 trace_file = sys.argv[1]
@@ -20,21 +21,38 @@ def debug_log(message):
 def parse_time(timestamp):
     return datetime.fromtimestamp(timestamp / 1_000_000)
 
+def extract_path_from_url(url):
+    parsed_url = urlparse(url)
+    return parsed_url.path
+
 def build_span_hierarchy(spans):
     span_dict = {}
     hierarchy = defaultdict(list)
     roots = []
     for span in spans:
         tags = span.get("tags", {})
-        if "http.request.method" not in tags and "db.statement" not in tags:
+        debug_log(f"Processing span {span['spanID']} with tags: {tags}")
+        if "http.request.method" not in tags and "db.statement" not in tags and "http.method" not in tags:
             debug_log(f"Skipping non-HTTP/DB span {span['spanID']}")
             continue
         if "http.request.method" in tags:
             method = tags["http.request.method"]
-            path = tags.get("http.target", tags.get("url.path", tags.get("http.route", "/*")))
-            span["operationName"] = f"{method} {path}"
+        elif "http.method" in tags:
+            method = tags["http.method"]
         else:
-            span["operationName"] = span.get("operationName", "UNKNOWN")
+            method = "UNKNOWN"
+
+        path = tags.get("http.target") or tags.get("url.path") or tags.get("http.route") or tags.get("url.full") or None
+        if path is None and "http.url" in tags:
+            path = extract_path_from_url(tags["http.url"])
+
+        if path is None:
+            path = "/*"
+            debug_log(f"Defaulting path to /* for span {span['spanID']} with method {method}. Missing tags: http.target, url.path, http.route, url.full, http.url. All tags: {tags}")
+        else:
+            debug_log(f"Span {span['spanID']} method: {method}, path: {path}")
+
+        span["operationName"] = f"{method} {path}"
         debug_log(f"Span {span['spanID']} operationName set to: {span['operationName']}")
         span_dict[span["spanID"]] = span
 
@@ -106,24 +124,37 @@ def extract_service_names(span, processes, span_dict):
 def extract_status_code(tags):
     return tags.get("http.response.status_code", tags.get("http.status_code", "N/A"))
 
-def compare_spans(span1, span2, span_dict, hierarchy):
+def compare_spans(span1, span2, span_dict, hierarchy, processes):
     if span1["operationName"] != span2["operationName"]:
         return False
-    req1, rec1 = extract_service_names(span1, {}, span_dict)
-    req2, rec2 = extract_service_names(span2, {}, span_dict)
+    req1, rec1 = extract_service_names(span1, processes, span_dict)
+    req2, rec2 = extract_service_names(span2, processes, span_dict)
     if req1 != req2 or rec1 != rec2:
         return False
-    if abs(span1["startTime"] - span2["startTime"]) > 50_000:
+    if abs(span1["startTime"] - span2["startTime"]) > 500_000:  # 500 ms tolerance
         return False
-    if abs(span1["duration"] - span2["duration"]) > 0.1 * max(span1["duration"], span2["duration"]):
+    if abs(span1["duration"] - span2["duration"]) > 0.2 * max(span1["duration"], span2["duration"]):
         return False
     children1 = sorted(hierarchy.get(span1["spanID"], []), key=lambda x: x["spanID"])
     children2 = sorted(hierarchy.get(span2["spanID"], []), key=lambda x: x["spanID"])
     if len(children1) != len(children2):
         return False
-    return all(compare_spans(c1, c2, span_dict, hierarchy) for c1, c2 in zip(children1, children2))
+    for c1, c2 in zip(children1, children2):
+        if c1["operationName"] != c2["operationName"]:
+            return False
+        req_c1, _ = extract_service_names(c1, processes, span_dict)
+        req_c2, _ = extract_service_names(c2, processes, span_dict)
+        if req_c1 != req_c2:
+            return False
+        kind1 = c1.get("tags", {}).get("span.kind", "")
+        kind2 = c2.get("tags", {}).get("span.kind", "")
+        if kind1 == "db" and kind2 == "db":
+            continue
+        if not compare_spans(c1, c2, span_dict, hierarchy, processes):
+            return False
+    return True
 
-def cluster_duplicates(group_spans, span_dict, hierarchy):
+def cluster_duplicates(group_spans, span_dict, hierarchy, processes):
     clusters = []
     used = set()
     for i, span1 in enumerate(group_spans):
@@ -132,7 +163,7 @@ def cluster_duplicates(group_spans, span_dict, hierarchy):
         cluster = [span1]
         used.add(span1["spanID"])
         for span2 in group_spans[i+1:]:
-            if span2["spanID"] not in used and compare_spans(span1, span2, span_dict, hierarchy):
+            if span2["spanID"] not in used and compare_spans(span1, span2, span_dict, hierarchy, processes):
                 cluster.append(span2)
                 used.add(span2["spanID"])
         if len(cluster) > 1:
@@ -150,13 +181,10 @@ def find_duplicate_spans(file_path):
         current_span_tags = []
         current_references = []
 
-        debug_log(f"Starting parsing, processes: {processes}")
+        debug_log(f"Starting parsing")
 
         for prefix, event, value in parser:
-            debug_log(f"Parsing: {prefix}, {event}, {value}, processes: {processes}")
             parts = prefix.split(".")
-            debug_log(f"Parts: {parts}")
-
             if prefix == "data.item.traceID" and event == "string":
                 trace_id = value
                 debug_log(f"Trace ID: {trace_id}")
@@ -205,15 +233,13 @@ def find_duplicate_spans(file_path):
                     current_span["processID"] = value
 
             elif prefix.startswith("data.item.processes"):
-                if len(parts) >= 3:
-                    pid = parts[2]
-                    debug_log(f"Checking pid: {pid}")
+                if len(parts) >= 4:
+                    pid = parts[3]
                     if pid.startswith("p") and pid[1:].isdigit():
-                        debug_log(f"Valid pid: {pid}")
                         if event == "string" and prefix.endswith(".serviceName"):
-                            debug_log(f"ServiceName detected for {pid}")
-                            processes[pid] = {"serviceName": value}
-                            debug_log(f"Set {pid} serviceName to: {value}")
+                            if pid not in processes:
+                                processes[pid] = {}
+                            processes[pid]["serviceName"] = value
 
         if not spans or not trace_id:
             debug_log(f"Spans: {len(spans)}, Trace ID: {trace_id}")
@@ -232,7 +258,7 @@ def find_duplicate_spans(file_path):
         duplicate_groups = {}
         for key, group in span_groups.items():
             if len(group) > 1:
-                duplicate_groups[key] = cluster_duplicates(group, span_dict, hierarchy)
+                duplicate_groups[key] = cluster_duplicates(group, span_dict, hierarchy, processes)
 
         debug_log(f"Final processes dict: {processes}")
         debug_log(f"Depth map: {depth_map}")
@@ -245,19 +271,19 @@ def summarize_duplicates(duplicate_groups, trace_id, processes, span_dict):
         return "\n".join(lines)
 
     for (op_name, depth), clusters in sorted(duplicate_groups.items()):
+        if len(clusters) == 0:
+            continue
         lines.append(f"Operation Name: {op_name} with Hierarchy Depth: {depth}")
         lines.append(f"Duplicate Cluster Count: {len(clusters)}\n")
         for i, cluster in enumerate(clusters[:10], 1):
-            lines.append(f"Cluster {i} (Size: {len(cluster)}):")
+            req, rec = extract_service_names(cluster[0], processes, span_dict)
+            lines.append(f"Cluster {i} -- Requesting Service: {req}, Receiving Service: {rec} (Size: {len(cluster)}):")
             for j, span in enumerate(cluster[:5], 1):
-                req, rec = extract_service_names(span, processes, span_dict)
+                start_time = parse_time(span["startTime"])
+                duration = span["duration"]
+                status_code = extract_status_code(span["tags"])
                 lines.extend([
-                    f"  Span {j} - ID: {span['spanID']}",
-                    f"    Requesting Service: {req}",
-                    f"    Receiving Service: {rec}",
-                    f"    Start Time: {parse_time(span['startTime'])}",
-                    f"    Duration: {span['duration']} microseconds",
-                    f"    HTTP Status Code: {extract_status_code(span['tags'])}"
+                    f"  Span {j} - ID: {span['spanID']}, Start Time: {start_time}, Duration: {duration} microseconds, HTTP Status Code: {status_code}"
                 ])
             if len(cluster) > 5:
                 lines.append(f"    ...and {len(cluster) - 5} more spans")
