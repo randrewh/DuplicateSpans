@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import ijson
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime
 import sys
 from urllib.parse import urlparse
@@ -136,7 +136,6 @@ def extract_status_code(tags):
     return tags.get("http.response.status_code", tags.get("http.status_code", "N/A"))
 
 def get_last_generation_operation(span, hierarchy, processes):
-    """Recursively find the operationName and service of the last generation (leaf nodes), enhancing DB queries."""
     children = hierarchy.get(span["spanID"], [])
     if not children:
         tags = span.get("tags", {})
@@ -145,7 +144,6 @@ def get_last_generation_operation(span, hierarchy, processes):
         if "db.statement" in tags:
             db_statement = tags["db.statement"]
             db_table = tags.get("db.sql.table", "unknown_table")
-            verb = db_statement.split()[0].upper() if db_statement else "QUERY"
             if db_table == "unknown_table" and db_statement:
                 parts = db_statement.upper().split("FROM")
                 if len(parts) > 1:
@@ -154,6 +152,7 @@ def get_last_generation_operation(span, hierarchy, processes):
                         db_table = after_from
             db_system = tags.get("db.system", "")
             prefix = f"{db_system} " if db_system else ""
+            verb = db_statement.split()[0].upper() if db_statement else "QUERY"
             op = f"{prefix}QUERY {verb} {db_table}"
         else:
             op = span["operationName"]
@@ -171,90 +170,105 @@ def get_last_generation_operation(span, hierarchy, processes):
     return leaf_ops[0]
 
 def compare_subtrees(span1, span2, span_dict, hierarchy, processes, depth):
-    children1 = sorted(hierarchy.get(span1["spanID"], []), key=lambda x: x["spanID"])
-    children2 = sorted(hierarchy.get(span2["spanID"], []), key=lambda x: x["spanID"])
+    debug_log(f"Comparing spans {span1['spanID']} vs {span2['spanID']} at depth {depth}")
+    children1 = sorted(hierarchy.get(span1["spanID"], []), key=lambda x: x["operationName"])
+    children2 = sorted(hierarchy.get(span2["spanID"], []), key=lambda x: x["operationName"])
     
-    # Top-level root gap check
-    time_diff = abs(span1["startTime"] - span2["startTime"])
-    if time_diff > 500_000:  # 500ms tolerance for start time
-        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - start time diff > 500ms: {time_diff}us")
+    def get_max_depth(span_id, current_depth=0):
+        kids = hierarchy.get(span_id, [])
+        if not kids:
+            return current_depth
+        return max(get_max_depth(k["spanID"], current_depth + 1) for k in kids)
+    
+    depth1 = get_max_depth(span1["spanID"])
+    depth2 = get_max_depth(span2["spanID"])
+    if depth1 < 2 or depth2 < 2 or depth1 != depth2:
+        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - depth mismatch or < 2: {depth1} vs {depth2}")
         return False
     
-    end1 = span1["startTime"] + span1["duration"]
-    end2 = span2["startTime"] + span2["duration"]
-    
-    if end1 < span2["startTime"]:
-        gap = span2["startTime"] - end1
-        if gap > 150_000:  # 150ms max gap for root spans
-            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - root no overlap, gap > 150ms: {gap}us")
+    if depth == 0:
+        time_diff = abs(span1["startTime"] - span2["startTime"])
+        if time_diff > 500_000:
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - start time diff > 500ms: {time_diff}us")
             return False
-    elif end2 < span1["startTime"]:
-        gap = span1["startTime"] - end2
-        if gap > 150_000:  # 150ms max gap for root spans
-            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - root no overlap, gap > 150ms: {gap}us")
+        end1 = span1["startTime"] + span1["duration"]
+        end2 = span2["startTime"] + span2["duration"]
+        if end1 < span2["startTime"]:
+            gap = span2["startTime"] - end1
+            if gap > 150_000:
+                debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - gap > 150ms: {gap}us")
+                return False
+        elif end2 < span1["startTime"]:
+            gap = span1["startTime"] - end2
+            if gap > 150_000:
+                debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - gap > 150ms: {gap}us")
+                return False
+        duration_diff = abs(span1["duration"] - span2["duration"])
+        max_duration = max(span1["duration"], span2["duration"])
+        if duration_diff > 100_000 and duration_diff > 0.2 * max_duration:
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - duration diff exceeds both 100ms and 20%: {duration_diff}us vs max {max_duration}us")
             return False
-    
-    if not children1 and not children2:
-        if is_db_span(span1) and is_db_span(span2):
-            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - DB leaf spans match (quantity 1)")
-            return True
-        if span1["operationName"] != span2["operationName"]:
-            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - leaf operationName mismatch: {span1['operationName']} != {span2['operationName']}")
-            return False
-        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - non-DB leaf spans match")
-        return True
+        else:
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - duration diff OK: {duration_diff}us vs max {max_duration}us")
     
     if span1["operationName"] != span2["operationName"]:
-        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - operationName mismatch at depth {depth}: {span1['operationName']} != {span2['operationName']}")
-        return False
+        if not (is_db_span(span1) and is_db_span(span2) and span1["operationName"].startswith("QUERY") and span2["operationName"].startswith("QUERY")):
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - operationName mismatch: {span1['operationName']} vs {span2['operationName']}")
+            return False
+        else:
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - DB QUERY operations treated as equivalent")
     
-    duration_diff = abs(span1["duration"] - span2["duration"])
-    max_duration = max(span1["duration"], span2["duration"])
-    if duration_diff > 100_000 and duration_diff > 0.2 * max_duration:
-        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - duration diff > 100ms and 20%: {duration_diff}us vs max {max_duration}us")
-        return False
+    if not children1 and not children2:
+        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - leaf nodes match")
+        return True
     
     if len(children1) != len(children2):
         debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - child count mismatch: {len(children1)} vs {len(children2)}")
         return False
     
-    for c1, c2 in zip(children1, children2):
-        if not compare_subtrees(c1, c2, span_dict, hierarchy, processes, depth + 1):
+    if any(is_db_span(c) for c in children1):
+        query_count1 = sum(1 for c in children1 if is_db_span(c))
+        query_count2 = sum(1 for c in children2 if is_db_span(c))
+        if abs(query_count1 - query_count2) > 1:
+            debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - DB query count mismatch: {query_count1} vs {query_count2}")
             return False
+        debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - DB query counts close enough: {query_count1} vs {query_count2}")
+    else:
+        for c1, c2 in zip(children1, children2):
+            if not compare_subtrees(c1, c2, span_dict, hierarchy, processes, depth + 1):
+                debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - child comparison failed at depth {depth + 1}")
+                return False
     
-    debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - subtrees match fully to bottom")
+    debug_log(f"Span {span1['spanID']} vs {span2['spanID']} - subtrees match fully")
     return True
-
-def cluster_parallel_subtrees(spans, span_dict, hierarchy, processes, parent_id, depth):
-    if depth < 2:
-        debug_log(f"Skipping parent {parent_id} at depth {depth} - depth < 2")
-        return []
     
+def cluster_parallel_subtrees(spans, span_dict, hierarchy, processes, parent_id, depth):
     debug_log(f"Clustering spans for parent {parent_id} at depth {depth}: {[s['spanID'] + ' ' + s['operationName'] for s in spans]}")
     spans = sorted(spans, key=lambda x: x["startTime"])
     
     clusters = []
-    used = set()
-    for i, span1 in enumerate(spans):
-        if span1["spanID"] in used:
+    remaining = spans[:]
+    while remaining:
+        root = remaining.pop(0)
+        if is_db_span(root):
+            debug_log(f"Skipping span {root['spanID']} - root is a DB query")
             continue
-        if is_db_span(span1):
-            debug_log(f"Skipping span {span1['spanID']} - root is a DB query")
-            continue
-        best_cluster = [span1]
-        best_gap = float('inf')
-        for span2 in spans[i+1:]:
-            if span2["spanID"] in used or is_db_span(span2):
-                continue
-            if compare_subtrees(span1, span2, span_dict, hierarchy, processes, depth):
-                gap = span2["startTime"] - (span1["startTime"] + span1["duration"])
-                if gap < best_gap and gap <= 150_000:  # Prefer tightest gap within 150ms
-                    best_cluster = [span1, span2]
-                    best_gap = gap
-        if len(best_cluster) > 1:
-            clusters.append(best_cluster)
-            used.update(s["spanID"] for s in best_cluster)
-            debug_log(f"Cluster formed for parent {parent_id} at depth {depth}: {[s['spanID'] for s in best_cluster]}")
+        cluster = [root]
+        i = 0
+        while i < len(remaining):
+            candidate = remaining[i]
+            debug_log(f"Attempting to match root {root['spanID']} with candidate {candidate['spanID']}")
+            if compare_subtrees(root, candidate, span_dict, hierarchy, processes, 0):
+                cluster.append(remaining.pop(i))
+                debug_log(f"Added {candidate['spanID']} to cluster with root {root['spanID']}")
+            else:
+                i += 1
+        debug_log(f"Finished clustering attempt with root {root['spanID']}, cluster size: {len(cluster)}")
+        if len(cluster) >= 2:
+            clusters.append(cluster)
+            debug_log(f"Cluster formed for parent {parent_id} at depth {depth}: {[s['spanID'] for s in cluster]}")
+        else:
+            debug_log(f"Span {root['spanID']} not clustered - no matches found")
     
     return clusters
     
@@ -407,6 +421,7 @@ def find_duplicate_spans(file_path):
     parent_depth_groups = defaultdict(list)
     for span in span_dict.values():
         depth = depth_map[span["spanID"]]
+        debug_log(f"Span {span['spanID']} has depth {depth}")
         if depth < 2:
             debug_log(f"Skipping span {span['spanID']} - depth {depth} < 2")
             continue
@@ -422,9 +437,12 @@ def find_duplicate_spans(file_path):
     duplicate_groups = {}
     for (parent_id, depth), group in parent_depth_groups.items():
         if len(group) > 1:
+            debug_log(f"Processing group for parent {parent_id} at depth {depth} with {len(group)} spans")
             clusters = cluster_parallel_subtrees(group, span_dict, hierarchy, processes, parent_id, depth)
             if clusters:
                 duplicate_groups[(parent_id, depth)] = clusters
+            else:
+                debug_log(f"No clusters formed for parent {parent_id} at depth {depth}")
 
     debug_log(f"Final processes dict: {processes}")
     debug_log(f"Depth map: {depth_map}")
